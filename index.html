@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d6e5c">
+  <title>Quét mã QR</title>
+  <style>
+    :root{font:16px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#13221d;background:#f3f5f4}
+    *{box-sizing:border-box}
+    body{margin:0;padding:20px;min-height:100vh;display:grid;place-items:center}
+    main{width:min(100%,520px);background:#fff;border:1px solid #e0e6e3;border-radius:18px;padding:20px;box-shadow:0 8px 28px rgba(19,34,29,.1)}
+    h1{font-size:20px;margin:0 0 6px}
+    p{margin:0 0 14px;color:#5f6f69}
+    video{display:block;width:100%;max-height:58vh;min-height:180px;object-fit:contain;background:#0b1210;border-radius:12px}
+    #status{min-height:24px;margin:12px 0;color:#43564f;font-size:14px}
+    input,button{font:inherit;border-radius:9px}
+    input{width:100%;height:44px;padding:0 12px;border:1px solid #cbd6d1}
+    button{min-height:44px;padding:0 16px;border:0;background:#0d6e5c;color:#fff;font-weight:650;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .row{display:flex;gap:8px;margin-top:10px}
+    .row input{flex:1;min-width:0}
+    .secondary{background:#e8f2ee;color:#0d5144}
+    #result{margin-top:12px}
+    #result[hidden]{display:none}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Quét mã QR</h1>
+    <p>Cho phép camera, rồi đưa mã QR vào giữa hình ảnh.</p>
+    <video id="preview" playsinline muted></video>
+    <div id="status" role="status" aria-live="polite">Nhấn “Bật camera” để bắt đầu.</div>
+    <div class="row">
+      <button id="start" type="button">Bật camera</button>
+      <button id="stop" class="secondary" type="button" disabled>Dừng</button>
+    </div>
+    <div id="result" hidden>
+      <label for="code">Mã đã nhận</label>
+      <div class="row">
+        <input id="code" autocomplete="off">
+        <button id="copy" class="secondary" type="button">Sao chép</button>
+      </div>
+    </div>
+    <div class="row">
+      <input id="manual" autocomplete="off" placeholder="Hoặc nhập mã QR">
+      <button id="submit" class="secondary" type="button">Gửi mã</button>
+    </div>
+  </main>
+  <script>
+    (function(){
+      var $ = function(id){ return document.getElementById(id); };
+      var params = new URLSearchParams(location.search);
+      var parentOrigin = '';
+      var nonce = params.get('nonce') || '';
+      var requestedOrigin = params.get('parentOrigin') || '';
+      var active = false;
+      var stream = null;
+      var detector = null;
+      var reader = null;
+      var timer = null;
+      var generation = 0;
+      var zxingPromise = null;
+
+      try {
+        var parsedOrigin = new URL(requestedOrigin);
+        var trustedGoogleOrigin = parsedOrigin.protocol === 'https:' &&
+          (parsedOrigin.hostname === 'script.google.com' ||
+           parsedOrigin.hostname === 'script.googleusercontent.com' ||
+           parsedOrigin.hostname.endsWith('.googleusercontent.com'));
+        if (trustedGoogleOrigin) parentOrigin = parsedOrigin.origin;
+      } catch (e) {}
+
+      function setStatus(message){ $('status').textContent = message; }
+
+      function stopCamera(){
+        active = false;
+        generation++;
+        clearTimeout(timer);
+        timer = null;
+        if (stream) {
+          stream.getTracks().forEach(function(track){ track.stop(); });
+          stream = null;
+        }
+        $('preview').srcObject = null;
+        $('start').disabled = false;
+        $('stop').disabled = true;
+      }
+
+      function loadZXing(){
+        if (window.ZXing && window.ZXing.BrowserMultiFormatReader) return Promise.resolve(true);
+        if (zxingPromise) return zxingPromise;
+        var urls = [
+          'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js',
+          'https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js'
+        ];
+        zxingPromise = new Promise(function(resolve){
+          var index = 0;
+          function next(){
+            if (index >= urls.length) return resolve(false);
+            var script = document.createElement('script');
+            script.src = urls[index++];
+            script.onload = function(){
+              resolve(!!(window.ZXing && window.ZXing.BrowserMultiFormatReader));
+            };
+            script.onerror = function(){
+              script.remove();
+              next();
+            };
+            document.head.appendChild(script);
+          }
+          next();
+        });
+        return zxingPromise;
+      }
+
+      function finish(code){
+        code = String(code || '').trim();
+        if (!code) return;
+        stopCamera();
+        $('result').hidden = false;
+        $('code').value = code;
+        setStatus(parentOrigin && nonce
+          ? 'Đã quét mã. Đang gửi về ứng dụng...'
+          : 'Đã quét mã. Bạn có thể sao chép mã bên dưới.');
+        if (parentOrigin && nonce && window.opener) {
+          try {
+            window.opener.postMessage({ type:'kk-qr-result', nonce:nonce, code:code }, parentOrigin);
+          } catch (e) {
+            setStatus('Đã quét mã nhưng chưa gửi được về ứng dụng. Hãy sao chép mã bên dưới.');
+          }
+        }
+      }
+
+      function scan(g){
+        if (!active || g !== generation) return;
+        var video = $('preview');
+        if (!detector || video.readyState < 2) {
+          timer = setTimeout(function(){ scan(g); }, 160);
+          return;
+        }
+        detector.detect(video).then(function(codes){
+          if (!active || g !== generation) return;
+          if (codes && codes.length && codes[0].rawValue) {
+            finish(codes[0].rawValue);
+            return;
+          }
+          timer = setTimeout(function(){ scan(g); }, 160);
+        }).catch(function(){
+          if (active && g === generation) timer = setTimeout(function(){ scan(g); }, 300);
+        });
+      }
+
+      function startCamera(){
+        stopCamera();
+        var g = generation;
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          setStatus('Trình duyệt không hỗ trợ camera. Hãy nhập mã QR thủ công.');
+          return;
+        }
+        setStatus('Đang xin quyền camera...');
+        if ('BarcodeDetector' in window) {
+          try { detector = new BarcodeDetector({ formats:['qr_code'] }); }
+          catch (e) { detector = null; }
+        }
+        navigator.mediaDevices.getUserMedia({
+          video:{ facingMode:{ ideal:'environment' } },
+          audio:false
+        }).then(function(cameraStream){
+          if (g !== generation) {
+            cameraStream.getTracks().forEach(function(track){ track.stop(); });
+            return;
+          }
+          stream = cameraStream;
+          active = true;
+          $('preview').srcObject = stream;
+          $('start').disabled = true;
+          $('stop').disabled = false;
+          return $('preview').play().then(function(){
+            if (detector) {
+              setStatus('Đang quét. Đưa mã QR vào giữa hình ảnh.');
+              scan(g);
+              return;
+            }
+            return loadZXing().then(function(loaded){
+              if (!active || g !== generation) return;
+              if (!loaded) {
+                stopCamera();
+                setStatus('Không tải được bộ đọc QR. Kiểm tra mạng rồi thử lại.');
+                return;
+              }
+              reader = reader || new window.ZXing.BrowserMultiFormatReader();
+              setStatus('Đang quét. Đưa mã QR vào giữa hình ảnh.');
+              reader.decodeFromVideoElement($('preview')).then(function(result){
+                if (active && g === generation && result && result.text) finish(result.text);
+              }).catch(function(error){
+                if (active && g === generation) {
+                  stopCamera();
+                  setStatus('Không đọc được QR (' + (error.message || 'lỗi bộ đọc') + '). Thử lại hoặc nhập mã.');
+                }
+              });
+            });
+          });
+        }).catch(function(error){
+          if (g !== generation) return;
+          var message = error && error.name === 'NotAllowedError'
+            ? 'Quyền camera bị từ chối. Hãy cho phép Camera cho trang GitHub Pages này rồi tải lại.'
+            : 'Không mở được camera (' + ((error && error.message) || 'lỗi thiết bị') + ').';
+          setStatus(message);
+        });
+      }
+
+      $('start').addEventListener('click', startCamera);
+      $('stop').addEventListener('click', function(){ stopCamera(); setStatus('Đã dừng camera.'); });
+      $('submit').addEventListener('click', function(){ finish($('manual').value); });
+      $('manual').addEventListener('keydown', function(event){
+        if (event.key === 'Enter') finish($('manual').value);
+      });
+      $('copy').addEventListener('click', function(){
+        $('code').select();
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText($('code').value).then(function(){ setStatus('Đã sao chép mã.'); });
+        } else {
+          document.execCommand('copy');
+          setStatus('Đã sao chép mã.');
+        }
+      });
+      window.addEventListener('pagehide', stopCamera);
+    })();
+  </script>
+</body>
+</html>
